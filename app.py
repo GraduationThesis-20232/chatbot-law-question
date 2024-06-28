@@ -8,9 +8,13 @@ from text_untils import *
 import torch
 import pymongo
 from bson import ObjectId
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 from pymongo import MongoClient
 
-# df = pd.read_json('data/cleaned/temp.json', lines=True)
+app = Flask(__name__)
+CORS(app)
+
 top_20_indices_title = []
 top_20_indices_anwser = []
 doc_scores = []
@@ -95,14 +99,12 @@ def handle_bm25(query):
     top_docs = bm25plus.get_top_n(query_bm25, [doc for doc in docs], n=50)
     bm25_scores = bm25plus.get_scores(query_bm25)
     global doc_scores
-    doc_scores = np.sort(bm25_scores)[::-1][:50]
+    doc_scores = np.sort(bm25_scores)[::-1][:500]
     # for doc_dict, score in zip(top_docs, doc_scores):
     #     doc_id = doc_dict['id']
     #     doc_title = doc_dict['title']
     #     print(f"ID: {doc_id}, Document: {doc_title}, Score: {score}")
 
-    # doc_ids = [doc_dict['id'] for doc_dict in top_docs]
-    # selected_rows = df[df['_id'].isin(doc_ids)]
     selected_rows = get_selected_rows_from_mongodb('lawlaboratory', 'questions_cleaned', top_docs)
 
     return selected_rows
@@ -199,64 +201,140 @@ def calculate_score():
 
     final_scores = sorted(final_scores, key=lambda x: x['final_score'], reverse=True)
 
-    return pd.DataFrame(final_scores[:5])
+    return final_scores[:5]
 
-def print_answer(doc_id):
+def getAnswer(doc_id):
     client = pymongo.MongoClient("mongodb://localhost:27017/")
-
     database = client["lawlaboratory"]
     collection = database["questions_cleaned"]
 
     document = collection.find_one({"_id": ObjectId(doc_id)})
-    print(doc_id)
+    result = {}
     if document:
-        # print("Title:", document.get('title'))
+        result['id'] = str(doc_id)
+        if 'title' in document and document['title']:
+            result['title'] = document.get('title')
 
         if 'field' in document and document['field']:
-            print("Lĩnh vực câu hỏi: ", document.get('field'))
+            result['field'] = document.get('field')
+
+        if 'source_url' in document and document['source_url']:
+            result['source_url'] = document.get('source_url')
 
         if 'reference' in document and document['reference']:
-            print("Điều luật tham khảo: ", document.get('reference'))
+            result['reference'] = document.get('reference')
 
         if 'quote' in document:
             quote = document['quote']
             if quote is not None:
-                print("Nội dung trích dẫn văn bản pháp luật như sau")
-                print(quote.get('name'))
-
-                quote_content = quote.get('content', [])
-                for item in quote_content:
-                    print(item)
+                result['quote'] = {
+                    'name': quote.get('name'),
+                    'content': quote.get('content', [])
+                }
 
         conclusion = document.get('conclusion', [])
-        print("Kết luận:")
-        for item in conclusion:
-            print(item)
+        result['conclusion'] = conclusion
 
-def same_question(df_final):
+    return result
+
+def same_question(questions_final):
     client = pymongo.MongoClient("mongodb://localhost:27017/")
-
     database = client["lawlaboratory"]
     collection = database["questions_cleaned"]
 
-    print("Các câu hỏi tương tự")
-    for index, row in df_final.iterrows():
+    same_questions = []
+    for index, row in enumerate(questions_final):
+        if index == 0:
+            continue
         doc_id_str = str(row['id'])
         document = collection.find_one({"_id": ObjectId(doc_id_str)})
         if document:
             title = document.get('title')
-            print(f"Câu hỏi: {title}")
+            source_url = document.get('source_url')
+            same_questions.append({"id": doc_id_str, "title": title, "source_url": source_url})
 
-if __name__ == '__main__':
-    query = input("Câu hỏi: ")
+    return same_questions
 
+@app.route('/query', methods=['POST'])
+def query():
+    data = request.json
+    query = data.get('question')
     selected_rows = handle_bm25(query)
-
     handle_sbert_title(query, selected_rows)
     handle_sbert_answer(query, selected_rows)
+    questions_final = calculate_score()
 
-    df_final = calculate_score()
+    doc_id_value = questions_final[0]['id']
+    main_answer = getAnswer(doc_id_value)
+    similar_questions = same_question(questions_final)
 
-    doc_id_value = df_final.iloc[0]['id']
-    print_answer(doc_id_value)
-    same_question(df_final)
+    response = {
+        "main_answer": main_answer,
+        "similar_questions": similar_questions
+    }
+    reset_variable()
+
+    return jsonify(response)
+
+def getAllLaws(database_name, collection_name):
+    client = pymongo.MongoClient('mongodb://localhost:27017/')
+    db = client[database_name]
+    collection = db[collection_name]
+    result = collection.find()
+
+    return list(result)
+
+def find_empty_laws(all_laws):
+    empty_laws = []
+    for law in all_laws:
+        if not law.get('parts') and not law.get('chapters') and not law.get('articles'):
+            empty_laws.append(law)
+    return empty_laws
+
+def delete_empty_laws_db(database_name, collection_name, empty_laws):
+    client = pymongo.MongoClient('mongodb://localhost:27017/')
+    db = client[database_name]
+    collection = db[collection_name]
+
+    for law in empty_laws:
+        identifier = law['identifier']
+        collection.delete_one({'identifier': identifier})
+@app.route('/delete/emptyLaw', methods=['POST'])
+def delete_empty_law_api():
+    laws = getAllLaws('lawlaboratory', 'laws')
+    codes = getAllLaws('lawlaboratory', 'codes')
+    constitution = getAllLaws("lawlaboratory", "constitution")
+    all_laws = laws + codes + constitution
+
+    empty_laws = find_empty_laws(all_laws)
+
+    delete_empty_laws_db('lawlaboratory', 'laws', empty_laws)
+    delete_empty_laws_db('lawlaboratory', 'codes', empty_laws)
+    delete_empty_laws_db('lawlaboratory', 'constitution', empty_laws)
+
+
+def reset_variable():
+    global top_20_indices_title
+    global top_20_indices_anwser
+    global doc_scores
+    global top_docs
+    global ids_title
+    global similarities_title
+    global sentences_title
+    global sentences_anwser
+    global ids_anwser
+    global similarities_anwser
+
+    top_20_indices_title = []
+    top_20_indices_anwser = []
+    doc_scores = []
+    top_docs = []
+    ids_title = []
+    similarities_title = []
+    sentences_title = []
+    sentences_anwser = []
+    ids_anwser = []
+    similarities_anwser = []
+
+if __name__ == '__main__':
+    app.run(host='127.0.0.1', port=5000)

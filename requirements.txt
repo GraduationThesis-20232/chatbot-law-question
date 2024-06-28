@@ -4,3 +4,11 @@ pandas
 sentence-transformers
 pickle
 dataframe
+py_vncorenlp
+jsonlines
+faiss-cpu
+pymongo
+jsonlines
+torch
+jupyter
+pyvi
